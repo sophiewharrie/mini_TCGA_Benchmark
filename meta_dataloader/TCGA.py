@@ -142,19 +142,25 @@ class TCGATask(Dataset):
         #matrix.drop_duplicates(subset=['sampleID'], keep='first', inplace=True)
         ids = matrix['sampleID']
         attribute = matrix[task_variable]
+        intervention = matrix['radiation_therapy']
 
         # filter all elements where the clinical variable is not available or the associated gene expression data
-        available_elements = attribute.notnull() & matrix['sampleID'].isin(self._all_sample_ids)
+        # NOTE added condition to only retain elements where radiation_therapy variable is present
+        available_elements = attribute.notnull() & matrix['sampleID'].isin(self._all_sample_ids) & matrix['radiation_therapy'].isin(['NO','YES'])
         sample_ids = ids[available_elements].tolist()
         filtered_attribute = attribute[available_elements].astype('category').cat
+        filtered_intervention = intervention[available_elements]
+        filtered_intervention = [0 if x == 'NO' else 1 if x == 'YES' else np.nan for x in filtered_intervention]
         self._labels = filtered_attribute.codes.tolist()
         self.categories = filtered_attribute.categories.tolist()
         self.num_classes = len(self.categories)
 
         # generator to retrieve the specific indices we need
-        indices_to_load = [self._all_sample_ids.index(sample_id) for sample_id in sample_ids]
-        indices_to_load, self._labels = zip(*sorted(zip(indices_to_load, self._labels)))
-
+        init_indices_to_load = [self._all_sample_ids.index(sample_id) for sample_id in sample_ids]
+        indices_to_load, self._labels = zip(*sorted(zip(init_indices_to_load, self._labels)))
+        # NOTE added an _interventions list for radiation_therapy
+        indices_to_load, self._interventions = zip(*sorted(zip(init_indices_to_load, filtered_intervention)))
+        
         # lazy loading or loading from preloaded data if available
         if preloaded is None:
             hdf_file = os.path.join(data_dir, "TCGA_HiSeqV2.hdf5")
@@ -162,6 +168,12 @@ class TCGATask(Dataset):
                 self._samples = f['dataset'][indices_to_load, :]
         else:
             self._samples = self._data[np.array(list(indices_to_load), dtype=int), :]
+            
+        # NOTE remove genes with mean expression levels in the lower quartile
+        mean_expression = self._samples.mean(axis=0)
+        lower_quartile = np.percentile(mean_expression, 25)
+        # store the indices of the genes to retain (with mean expression > lower quartile)
+        self._retain_genes = np.where(mean_expression >= lower_quartile)
             
         self.input_size = self._samples.shape[1]
 
@@ -203,30 +215,31 @@ def get_TCGA_task_ids(data_dir=None, min_samples_per_class=3, task_variables_fil
 
     task_ids = []
     for filename in os.listdir(os.path.join(data_dir, 'clinicalMatrices')):
-        matrix = pd.read_csv(os.path.join(data_dir, 'clinicalMatrices', filename), delimiter='\t')
+        if not filename.startswith('.'): # ignore hidden files, like .py checkpoints
+            matrix = pd.read_csv(os.path.join(data_dir, 'clinicalMatrices', filename), delimiter='\t')
 
-        for task_variable in task_variables:
-            try:
-                # if this task_variable exists for this cancer find the sample_ids for this task
-                filter_clinical_variable_present = matrix[task_variable].notnull()
-                # filter out all sample_ids for which no valid value exists
-                potential_sample_ids = matrix['sampleID'][filter_clinical_variable_present]
-                # filter out all sample_ids for which no gene expression data exists
-                task_sample_ids = set(potential_sample_ids).intersection(all_sample_ids)
-#                task_sample_ids = [sample_id for sample_id in potential_sample_ids if sample_id in all_sample_ids]
-            except KeyError:
-                continue
+            for task_variable in task_variables:
+                try:
+                    # if this task_variable exists for this cancer find the sample_ids for this task
+                    filter_clinical_variable_present = matrix[task_variable].notnull()
+                    # filter out all sample_ids for which no valid value exists
+                    potential_sample_ids = matrix['sampleID'][filter_clinical_variable_present]
+                    # filter out all sample_ids for which no gene expression data exists
+                    task_sample_ids = set(potential_sample_ids).intersection(all_sample_ids)
+    #                task_sample_ids = [sample_id for sample_id in potential_sample_ids if sample_id in all_sample_ids]
+                except KeyError:
+                    continue
 
-            task_id = (task_variable, filename.split('_')[0])
+                task_id = (task_variable, filename.split('_')[0])
 
-            num_samples_per_label = Counter(matrix[task_variable][matrix['sampleID'].isin(task_sample_ids)])
+                num_samples_per_label = Counter(matrix[task_variable][matrix['sampleID'].isin(task_sample_ids)])
 
-            # only add this task for the specified range of number of samples
-            num_samples_per_class_is_in_range = all([num_samples > min_samples_per_class for num_samples in num_samples_per_label.values()])
-            # Make sure this task is not a one-class classification in the first place
-            is_not_one_class = len(num_samples_per_label) > 1
-            if num_samples_per_class_is_in_range and is_not_one_class:
-                task_ids.append(task_id)
+                # only add this task for the specified range of number of samples
+                num_samples_per_class_is_in_range = all([num_samples > min_samples_per_class for num_samples in num_samples_per_label.values()])
+                # Make sure this task is not a one-class classification in the first place
+                is_not_one_class = len(num_samples_per_label) > 1
+                if num_samples_per_class_is_in_range and is_not_one_class:
+                    task_ids.append(task_id)
     return task_ids
 
 
@@ -257,13 +270,14 @@ def _download(data_dir, cancers):
         url = 'https://tcga.xenahubs.net/download/TCGA.{}.sampleMap/{}_clinicalMatrix.gz'.format(cancer, cancer)
 
         print('Downloading ' + url)
-        data = urllib.request.urlopen(url)
+        # downloaded manually from https://github.com/mila-iqia/gene-graph-conv/tree/master/meta_dataloader/data because source link is broekn
+        #data = urllib.request.urlopen(url)
 
-        with open(file_path, 'wb') as f:
-            f.write(data.read())
-        with open(decompressed_file_path, 'wb') as out_f, gzip.GzipFile(file_path) as zip_f:
-            out_f.write(zip_f.read())
-        os.unlink(file_path)
+        #with open(file_path, 'wb') as f:
+        #    f.write(data.read())
+        #with open(decompressed_file_path, 'wb') as out_f, gzip.GzipFile(file_path) as zip_f:
+        #    out_f.write(zip_f.read())
+        #os.unlink(file_path)
 
         if os.stat(decompressed_file_path).st_size == 0:
             os.remove(decompressed_file_path)
